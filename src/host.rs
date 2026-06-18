@@ -24,7 +24,9 @@ use crate::error::{Result, SparkplugError};
 use crate::model::{Metric, Payload};
 use crate::state::StatePayload;
 use crate::topic::{DeviceId, EdgeNodeId, GroupId, MessageType, SparkplugTopic};
-use crate::transport::{ConnectOptions, IncomingMessage, MqttTransport, OutboundMessage, Qos};
+use crate::transport::{
+    ConnectOptions, IncomingMessage, MqttTransport, OutboundMessage, Qos, TlsConfig,
+};
 use crate::value::MetricValue;
 use crate::{BDSEQ_METRIC_NAME, NODE_CONTROL_REBIRTH};
 
@@ -52,6 +54,8 @@ pub struct HostConfig {
     pub keep_alive_secs: u16,
     /// Debounce window for rebirth requests, per Edge Node.
     pub rebirth_debounce: Duration,
+    /// Optional TLS/mTLS configuration (honored with the `tls` feature).
+    pub tls: Option<TlsConfig>,
 }
 
 impl HostConfig {
@@ -66,6 +70,7 @@ impl HostConfig {
             port: 1883,
             keep_alive_secs: 30,
             rebirth_debounce: Duration::from_secs(5),
+            tls: None,
         }
     }
 
@@ -267,7 +272,7 @@ impl<T: MqttTransport> HostApplication<T> {
             keep_alive_secs: self.config.keep_alive_secs,
             clean_start: true,
             will: Some(will),
-            tls: None,
+            tls: self.config.tls.clone(),
         };
         self.transport.connect(&opts).await?;
 

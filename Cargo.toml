@@ -19,8 +19,19 @@ default = []
 compression = ["dep:flate2"]
 # A `rumqttc`-backed MqttTransport (MQTT v5).
 transport-rumqttc = ["dep:rumqttc", "dep:tokio"]
-# Embedded `rumqttd` broker for the end-to-end integration test (test-only).
-sim = ["transport-rumqttc", "dep:rumqttd", "tokio/rt-multi-thread"]
+# TLS / mTLS for the rumqttc transport (rustls 0.22 via rumqttc's use-rustls;
+# ring is compiled in, so no CryptoProvider install is needed).
+tls = ["transport-rumqttc", "rumqttc?/use-rustls"]
+# Embedded `rumqttd` broker for the end-to-end integration test (test-only),
+# with a TLS listener + client-cert verification for the mTLS e2e.
+sim = [
+    "transport-rumqttc",
+    "tls",
+    "dep:rumqttd",
+    "rumqttd/use-rustls",
+    "rumqttd/verify-client-cert",
+    "tokio/rt-multi-thread",
+]
 
 [dependencies]
 # Zero-copy buffers for payload body / bytes_value / packed arrays.
@@ -42,6 +53,10 @@ tokio = { version = "1", optional = true, features = ["time"] }
 proptest = "1"
 # Drives the async Edge Node engine tests (an in-memory transport, no broker).
 tokio = { version = "1", features = ["macros", "rt"] }
+# Ephemeral test PKI (CA + server + client certs) for the mTLS e2e (sim feature).
+rcgen = "=0.13.2"
+# Materializes the broker's PEM files to a temp dir for the mTLS e2e.
+tempfile = "3"
 
 [lints.rust]
 # The whole crate is safe Rust; the codec never needs unsafe and never panics on input.

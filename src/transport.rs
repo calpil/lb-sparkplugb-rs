@@ -135,6 +135,54 @@ mod rumqtt_impl {
         SparkplugError::Transport(e.to_string())
     }
 
+    /// Apply a [`super::TlsConfig`] to the MQTT options (server-only TLS when only
+    /// a CA is given; mTLS when a client cert + key are both present).
+    #[cfg(feature = "tls")]
+    fn apply_tls(options: &mut MqttOptions, tls: Option<&super::TlsConfig>) -> Result<()> {
+        use rumqttc::{TlsConfiguration, Transport};
+
+        let Some(tls) = tls else {
+            return Ok(());
+        };
+        // A server-trust CA is mandatory; we never load native roots (that path
+        // panics on a bad cert).
+        let Some(ca) = tls.ca_pem.clone() else {
+            return Err(SparkplugError::Transport(
+                "TLS requested without a CA certificate (TlsConfig.ca_pem is None)".to_owned(),
+            ));
+        };
+        // mTLS iff BOTH a client cert and key are present; exactly one is a
+        // misconfiguration we reject rather than silently downgrade.
+        let client_auth = match (&tls.client_cert_pem, &tls.client_key_pem) {
+            (Some(cert), Some(key)) => Some((cert.clone(), key.clone())),
+            (None, None) => None,
+            _ => {
+                return Err(SparkplugError::Transport(
+                    "mTLS requires BOTH client_cert_pem and client_key_pem".to_owned(),
+                ));
+            }
+        };
+        options.set_transport(Transport::tls_with_config(TlsConfiguration::Simple {
+            ca,
+            alpn: None,
+            client_auth,
+        }));
+        Ok(())
+    }
+
+    /// Without the `tls` feature, a TLS request fails loud rather than silently
+    /// connecting in the clear.
+    #[cfg(not(feature = "tls"))]
+    fn apply_tls(_options: &mut MqttOptions, tls: Option<&super::TlsConfig>) -> Result<()> {
+        if tls.is_some() {
+            return Err(SparkplugError::Transport(
+                "TLS was requested but the `tls` feature is disabled; would connect in plaintext"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// A [`MqttTransport`] backed by the `rumqttc` MQTT v5 async client.
     ///
     /// **The event loop must be pumped.** `subscribe`/`publish` only *enqueue*
@@ -144,8 +192,10 @@ mod rumqtt_impl {
     /// otherwise queued messages are never sent and, once the channel fills,
     /// `publish`/`subscribe` will block. `connect` only polls until the CONNACK.
     ///
-    /// TLS is not yet wired: if [`super::ConnectOptions::tls`] is `Some`, `connect`
-    /// fails loudly rather than silently downgrading to plaintext.
+    /// TLS/mTLS: with the `tls` feature, [`super::ConnectOptions::tls`] is honored
+    /// (server-only TLS when only `ca_pem` is set; mTLS when a client cert + key
+    /// are also present). Without the `tls` feature, a TLS request fails loudly
+    /// rather than silently connecting in plaintext.
     pub struct RumqttcTransport {
         client: Option<AsyncClient>,
         eventloop: Option<EventLoop>,
@@ -187,13 +237,6 @@ mod rumqtt_impl {
 
     impl MqttTransport for RumqttcTransport {
         async fn connect(&mut self, opts: &ConnectOptions) -> Result<()> {
-            if opts.tls.is_some() {
-                // Fail loud rather than silently connecting in the clear.
-                return Err(SparkplugError::Transport(
-                    "TLS is not yet wired in the rumqttc backend; would connect in plaintext"
-                        .to_owned(),
-                ));
-            }
             let mut options =
                 MqttOptions::new(opts.client_id.clone(), opts.host.clone(), opts.port);
             options.set_keep_alive(Duration::from_secs(u64::from(opts.keep_alive_secs)));
@@ -213,6 +256,7 @@ mod rumqtt_impl {
                     None,
                 ));
             }
+            apply_tls(&mut options, opts.tls.as_ref())?;
 
             let (client, mut eventloop) = AsyncClient::new(options, self.channel_capacity);
 
