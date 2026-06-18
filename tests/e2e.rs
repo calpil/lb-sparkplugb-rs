@@ -77,6 +77,57 @@ impl DataSource for Demo {
     }
 }
 
+/// Drain `rx` until `pred` matches an event, or the deadline elapses.
+async fn wait_for(
+    rx: &mut mpsc::UnboundedReceiver<HostEvent>,
+    deadline: Duration,
+    mut pred: impl FnMut(&HostEvent) -> bool,
+) -> bool {
+    tokio::time::timeout(deadline, async {
+        while let Some(event) = rx.recv().await {
+            if pred(&event) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Start a host, connect it, and stream its events over a channel.
+async fn start_host(port: u16) -> mpsc::UnboundedReceiver<HostEvent> {
+    let mut cfg = HostConfig::new("scada");
+    cfg.host = "127.0.0.1".to_owned();
+    cfg.port = port;
+    cfg.rebirth_debounce = Duration::from_millis(200);
+    let mut host = HostApplication::new(cfg, RumqttcTransport::new());
+    host.start().await.expect("host connects");
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            match host.recv_and_handle().await {
+                Ok(Some(event)) => {
+                    if tx.send(event).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    });
+    rx
+}
+
+fn edge(port: u16) -> EdgeNode<RumqttcTransport, InMemoryBdSeqStore> {
+    let mut cfg = EdgeNodeConfig::new("G", "E", &[]).expect("valid ids");
+    cfg.host = "127.0.0.1".to_owned();
+    cfg.port = port;
+    cfg.rebirth_debounce = Duration::ZERO;
+    EdgeNode::new(cfg, RumqttcTransport::new(), InMemoryBdSeqStore::new(0))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn edge_and_host_exchange_sparkplug_over_a_real_broker() {
     let port = pick_ephemeral_port();
@@ -162,5 +213,46 @@ async fn edge_and_host_exchange_sparkplug_over_a_real_broker() {
     assert!(
         matches!(outcome, Ok(true)),
         "host should receive the edge's NBIRTH and NDATA(42.0) over the broker"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edge_death_reaches_host_via_the_mqtt_will() {
+    let port = pick_ephemeral_port();
+    let _broker = start_broker(port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut rx = start_host(port).await;
+    tokio::time::sleep(Duration::from_millis(400)).await; // host subscribes first
+
+    let mut edge = edge(port);
+    edge.connect(&Demo).await.expect("edge connects + births");
+    let edge_task = tokio::spawn(async move {
+        loop {
+            if edge.recv_and_handle(&Demo).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    });
+
+    assert!(
+        wait_for(&mut rx, Duration::from_secs(15), |e| matches!(
+            e,
+            HostEvent::NodeBirth { .. }
+        ))
+        .await,
+        "host received the edge's NBIRTH"
+    );
+
+    // Drop the edge ungracefully (no DISCONNECT) -> the broker delivers the will.
+    edge_task.abort();
+
+    assert!(
+        wait_for(&mut rx, Duration::from_secs(15), |e| matches!(
+            e,
+            HostEvent::NodeDeath { .. }
+        ))
+        .await,
+        "host received the NDEATH delivered as the MQTT will after the edge dropped"
     );
 }

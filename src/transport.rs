@@ -106,7 +106,9 @@ pub trait MqttTransport {
     /// Await the next inbound message, or `None` once the stream is closed.
     ///
     /// # Errors
-    /// Returns an error if the transport fails while receiving.
+    /// Returns an error if the transport fails while receiving. An error may be
+    /// **transient** (e.g. a reconnecting client): a run-loop should generally
+    /// log/back-off and call `recv` again rather than treat it as terminal.
     async fn recv(&mut self) -> Result<Option<IncomingMessage>>;
 }
 
@@ -115,8 +117,8 @@ mod rumqtt_impl {
     use std::time::{Duration, Instant};
 
     use rumqttc::v5::mqttbytes::QoS as RumqttQos;
-    use rumqttc::v5::mqttbytes::v5::LastWill;
-    use rumqttc::v5::{AsyncClient, Event, EventLoop, Incoming, MqttOptions};
+    use rumqttc::v5::mqttbytes::v5::{ConnectProperties, LastWill};
+    use rumqttc::v5::{AsyncClient, ConnectionError, Event, EventLoop, Incoming, MqttOptions};
 
     use super::{ConnectOptions, IncomingMessage, MqttTransport, OutboundMessage, Qos};
     use crate::error::{Result, SparkplugError};
@@ -135,10 +137,15 @@ mod rumqtt_impl {
 
     /// A [`MqttTransport`] backed by the `rumqttc` MQTT v5 async client.
     ///
-    /// The connection is driven by [`MqttTransport::recv`] (which polls the event
-    /// loop, flushing queued publishes/subscriptions and returning the next
-    /// inbound message). TLS wiring (mapping [`super::TlsConfig`] to
-    /// `rumqttc::Transport`) is left for a TLS-feature build.
+    /// **The event loop must be pumped.** `subscribe`/`publish` only *enqueue*
+    /// requests onto a bounded channel; nothing reaches the broker until
+    /// [`MqttTransport::recv`] polls the event loop. A caller MUST therefore drive
+    /// `recv` continuously (e.g. the edge/host engines' `recv_and_handle` loop) —
+    /// otherwise queued messages are never sent and, once the channel fills,
+    /// `publish`/`subscribe` will block. `connect` only polls until the CONNACK.
+    ///
+    /// TLS is not yet wired: if [`super::ConnectOptions::tls`] is `Some`, `connect`
+    /// fails loudly rather than silently downgrading to plaintext.
     pub struct RumqttcTransport {
         client: Option<AsyncClient>,
         eventloop: Option<EventLoop>,
@@ -154,7 +161,7 @@ mod rumqtt_impl {
                 client: None,
                 eventloop: None,
                 connect_timeout: Duration::from_secs(10),
-                channel_capacity: 64,
+                channel_capacity: 256,
             }
         }
 
@@ -180,10 +187,23 @@ mod rumqtt_impl {
 
     impl MqttTransport for RumqttcTransport {
         async fn connect(&mut self, opts: &ConnectOptions) -> Result<()> {
+            if opts.tls.is_some() {
+                // Fail loud rather than silently connecting in the clear.
+                return Err(SparkplugError::Transport(
+                    "TLS is not yet wired in the rumqttc backend; would connect in plaintext"
+                        .to_owned(),
+                ));
+            }
             let mut options =
                 MqttOptions::new(opts.client_id.clone(), opts.host.clone(), opts.port);
             options.set_keep_alive(Duration::from_secs(u64::from(opts.keep_alive_secs)));
             options.set_clean_start(opts.clean_start);
+            // MQTT 5.0: Sparkplug requires Clean Start = true AND Session Expiry
+            // Interval = 0 (tck-id-principles-persistence-clean-session-50). Set the
+            // property explicitly so it is present on the wire for strict brokers/TCK.
+            let mut props = ConnectProperties::new();
+            props.session_expiry_interval = Some(0);
+            options.set_connect_properties(props);
             if let Some(will) = &opts.will {
                 options.set_last_will(LastWill::new(
                     will.topic.clone(),
@@ -203,6 +223,12 @@ mod rumqtt_impl {
                 match tokio::time::timeout(Duration::from_secs(1), eventloop.poll()).await {
                     Ok(Ok(Event::Incoming(Incoming::ConnAck(_)))) => break,
                     Ok(Ok(_)) => {}
+                    // A refused CONNACK or non-CONNACK first packet is fatal —
+                    // fail fast with the reason instead of spinning to the deadline.
+                    Ok(Err(
+                        e
+                        @ (ConnectionError::ConnectionRefused(_) | ConnectionError::NotConnAck(_)),
+                    )) => return Err(transport_err(e)),
                     Ok(Err(_)) => tokio::time::sleep(Duration::from_millis(50)).await,
                     Err(_elapsed) => {}
                 }
