@@ -20,7 +20,10 @@ compression = ["dep:flate2"]
 # A `rumqttc`-backed MqttTransport (MQTT v5).
 transport-rumqttc = ["dep:rumqttc", "dep:tokio"]
 # TLS / mTLS for the rumqttc transport (rustls 0.22 via rumqttc's use-rustls;
-# ring is compiled in, so no CryptoProvider install is needed).
+# ring is compiled in, so no CryptoProvider install is needed). NOTE: the
+# rumqttc =0.24.0 pin is load-bearing for that property — do not bump rumqttc/
+# rustls off the ring-backed 0.22 tree without re-checking ClientConfig::builder()
+# (rustls 0.23 consults a process-default provider and would need an install).
 tls = ["transport-rumqttc", "rumqttc?/use-rustls"]
 # Embedded `rumqttd` broker for the end-to-end integration test (test-only),
 # with a TLS listener + client-cert verification for the mTLS e2e.

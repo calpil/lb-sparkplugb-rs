@@ -58,7 +58,9 @@ pub struct IncomingMessage {
 pub struct ConnectOptions {
     /// MQTT client id.
     pub client_id: String,
-    /// Broker host.
+    /// Broker host. With TLS this is also matched against the server
+    /// certificate's SubjectAltName, so it must be covered by the cert (e.g.
+    /// `127.0.0.1` needs an IP SAN, a DNS name needs a matching DNS SAN).
     pub host: String,
     /// Broker port.
     pub port: u16,
@@ -137,6 +139,10 @@ mod rumqtt_impl {
 
     /// Apply a [`super::TlsConfig`] to the MQTT options (server-only TLS when only
     /// a CA is given; mTLS when a client cert + key are both present).
+    ///
+    /// Server-certificate chain validation against the supplied CA and
+    /// hostname/SAN verification are always on (rumqttc's default rustls
+    /// verifier) — there is no opt-out, and we never load native roots.
     #[cfg(feature = "tls")]
     fn apply_tls(options: &mut MqttOptions, tls: Option<&super::TlsConfig>) -> Result<()> {
         use rumqttc::{TlsConfiguration, Transport};

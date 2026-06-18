@@ -265,8 +265,14 @@ async fn edge_death_reaches_host_via_the_mqtt_will() {
 
 // ---- TLS / mTLS ----------------------------------------------------------
 
-/// An ephemeral test PKI: (ca, server cert, server key, client cert, client key) PEMs.
+/// An ephemeral test PKI with the default server SANs (127.0.0.1 + localhost).
 fn gen_pki() -> (String, String, String, String, String) {
+    gen_pki_with_server_sans(&["127.0.0.1", "localhost"])
+}
+
+/// An ephemeral test PKI: (ca, server cert, server key, client cert, client key)
+/// PEMs, with caller-chosen server SubjectAltNames.
+fn gen_pki_with_server_sans(server_sans: &[&str]) -> (String, String, String, String, String) {
     use rcgen::{
         BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
         KeyPair, KeyUsagePurpose,
@@ -284,10 +290,15 @@ fn gen_pki() -> (String, String, String, String, String) {
     ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
     let ca_cert: Certificate = ca_params.self_signed(&ca_key).expect("ca self-sign");
 
-    // (2) Server leaf: SAN 127.0.0.1 (IP) + localhost (DNS), ServerAuth.
+    // (2) Server leaf: caller-chosen SANs (rcgen auto-classifies IP vs DNS), ServerAuth.
     let server_key = KeyPair::generate().expect("server keypair");
-    let mut srv = CertificateParams::new(vec!["127.0.0.1".to_owned(), "localhost".to_owned()])
-        .expect("srv params");
+    let mut srv = CertificateParams::new(
+        server_sans
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>(),
+    )
+    .expect("srv params");
     srv.distinguished_name
         .push(DnType::CommonName, "sparkplug-broker");
     srv.use_authority_key_identifier_extension = true;
@@ -437,15 +448,60 @@ async fn mtls_broker_rejects_a_client_without_a_certificate() {
         client_cert_pem: None,
         client_key_pem: None,
     };
+    assert!(
+        host_connect_fails(port, tls).await,
+        "the mTLS broker must reject a client that presents no certificate"
+    );
+}
+
+/// Build a host inline (short connect timeout) and report whether `connect` failed.
+async fn host_connect_fails(port: u16, tls: TlsConfig) -> bool {
     let mut cfg = HostConfig::new("scada");
     cfg.host = "127.0.0.1".to_owned();
     cfg.port = port;
     cfg.tls = Some(tls);
     let transport = RumqttcTransport::new().with_connect_timeout(Duration::from_secs(3));
-    let mut host = HostApplication::new(cfg, transport);
+    HostApplication::new(cfg, transport).start().await.is_err()
+}
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_rejects_an_untrusted_server_certificate() {
+    // Broker uses PKI #1; the client trusts a DIFFERENT CA (#2) but presents a
+    // valid (#1) client cert — so the only thing that can fail is server-cert
+    // trust. The client MUST refuse the untrusted server cert (anti-MITM).
+    let (ca1, server1, key1, client1, client_key1) = gen_pki();
+    let (ca2, _s2, _k2, _c2, _ck2) = gen_pki();
+    let port = pick_ephemeral_port();
+    let _broker = start_broker_mtls(port, &ca1, &server1, &key1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let tls = TlsConfig {
+        ca_pem: Some(ca2.into_bytes()), // wrong CA for the server
+        client_cert_pem: Some(client1.into_bytes()),
+        client_key_pem: Some(client_key1.into_bytes()),
+    };
     assert!(
-        host.start().await.is_err(),
-        "the mTLS broker must reject a client that presents no certificate"
+        host_connect_fails(port, tls).await,
+        "client must reject a server cert signed by an untrusted CA"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_rejects_a_server_cert_with_mismatched_san() {
+    // Server cert SAN is localhost-only; the client connects to 127.0.0.1, so
+    // rustls' name verification must reject the (IP) host as not covered.
+    let (ca, server, key, client, client_key) = gen_pki_with_server_sans(&["localhost"]);
+    let port = pick_ephemeral_port();
+    let _broker = start_broker_mtls(port, &ca, &server, &key);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let tls = TlsConfig {
+        ca_pem: Some(ca.into_bytes()),
+        client_cert_pem: Some(client.into_bytes()),
+        client_key_pem: Some(client_key.into_bytes()),
+    };
+    assert!(
+        host_connect_fails(port, tls).await,
+        "client must reject a server cert whose SAN does not cover the connect host"
     );
 }
