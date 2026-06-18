@@ -17,6 +17,10 @@ path = "src/lib.rs"
 default = []
 # Optional DEFLATE/GZIP payload envelope (uuid == "SPBV1.0_COMPRESSED").
 compression = ["dep:flate2"]
+# A `rumqttc`-backed MqttTransport (MQTT v5).
+transport-rumqttc = ["dep:rumqttc", "dep:tokio"]
+# Embedded `rumqttd` broker for the end-to-end integration test (test-only).
+sim = ["transport-rumqttc", "dep:rumqttd", "tokio/rt-multi-thread"]
 
 [dependencies]
 # Zero-copy buffers for payload body / bytes_value / packed arrays.
@@ -25,6 +29,13 @@ bytes = "1"
 thiserror = "2"
 # Payload compression (optional, non-standard but supported by the Tahu/spec envelope).
 flate2 = { version = "1", optional = true }
+# Default MQTT v5 client for the rumqttc transport (pinned to the version proven
+# with rumqttd 0.20 in this repo's feat#9 driver).
+rumqttc = { version = "=0.24.0", optional = true, default-features = false }
+# Embedded broker for the e2e sim (test-only; never built unless `sim` is on).
+rumqttd = { version = "=0.20.0", optional = true, default-features = false }
+# Used by the rumqttc transport for connect timeouts / retry sleeps.
+tokio = { version = "1", optional = true, features = ["time"] }
 
 [dev-dependencies]
 # Property-based round-trip tests of the codec.

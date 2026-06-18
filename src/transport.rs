@@ -109,3 +109,163 @@ pub trait MqttTransport {
     /// Returns an error if the transport fails while receiving.
     async fn recv(&mut self) -> Result<Option<IncomingMessage>>;
 }
+
+#[cfg(feature = "transport-rumqttc")]
+mod rumqtt_impl {
+    use std::time::{Duration, Instant};
+
+    use rumqttc::v5::mqttbytes::QoS as RumqttQos;
+    use rumqttc::v5::mqttbytes::v5::LastWill;
+    use rumqttc::v5::{AsyncClient, Event, EventLoop, Incoming, MqttOptions};
+
+    use super::{ConnectOptions, IncomingMessage, MqttTransport, OutboundMessage, Qos};
+    use crate::error::{Result, SparkplugError};
+
+    const fn to_rumqtt_qos(qos: Qos) -> RumqttQos {
+        match qos {
+            Qos::AtMostOnce => RumqttQos::AtMostOnce,
+            Qos::AtLeastOnce => RumqttQos::AtLeastOnce,
+            Qos::ExactlyOnce => RumqttQos::ExactlyOnce,
+        }
+    }
+
+    fn transport_err(e: impl ToString) -> SparkplugError {
+        SparkplugError::Transport(e.to_string())
+    }
+
+    /// A [`MqttTransport`] backed by the `rumqttc` MQTT v5 async client.
+    ///
+    /// The connection is driven by [`MqttTransport::recv`] (which polls the event
+    /// loop, flushing queued publishes/subscriptions and returning the next
+    /// inbound message). TLS wiring (mapping [`super::TlsConfig`] to
+    /// `rumqttc::Transport`) is left for a TLS-feature build.
+    pub struct RumqttcTransport {
+        client: Option<AsyncClient>,
+        eventloop: Option<EventLoop>,
+        connect_timeout: Duration,
+        channel_capacity: usize,
+    }
+
+    impl RumqttcTransport {
+        /// A new, unconnected transport (call [`MqttTransport::connect`]).
+        #[must_use]
+        pub fn new() -> Self {
+            Self {
+                client: None,
+                eventloop: None,
+                connect_timeout: Duration::from_secs(10),
+                channel_capacity: 64,
+            }
+        }
+
+        /// Override how long [`MqttTransport::connect`] waits for the CONNACK.
+        #[must_use]
+        pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+            self.connect_timeout = timeout;
+            self
+        }
+
+        fn client(&self) -> Result<&AsyncClient> {
+            self.client
+                .as_ref()
+                .ok_or_else(|| SparkplugError::Transport("not connected".to_owned()))
+        }
+    }
+
+    impl Default for RumqttcTransport {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl MqttTransport for RumqttcTransport {
+        async fn connect(&mut self, opts: &ConnectOptions) -> Result<()> {
+            let mut options =
+                MqttOptions::new(opts.client_id.clone(), opts.host.clone(), opts.port);
+            options.set_keep_alive(Duration::from_secs(u64::from(opts.keep_alive_secs)));
+            options.set_clean_start(opts.clean_start);
+            if let Some(will) = &opts.will {
+                options.set_last_will(LastWill::new(
+                    will.topic.clone(),
+                    will.payload.to_vec(),
+                    to_rumqtt_qos(will.qos),
+                    will.retain,
+                    None,
+                ));
+            }
+
+            let (client, mut eventloop) = AsyncClient::new(options, self.channel_capacity);
+
+            // Drive the event loop until the CONNACK; the broker may still be
+            // binding, so a poll error is retried until the deadline.
+            let deadline = Instant::now() + self.connect_timeout;
+            loop {
+                match tokio::time::timeout(Duration::from_secs(1), eventloop.poll()).await {
+                    Ok(Ok(Event::Incoming(Incoming::ConnAck(_)))) => break,
+                    Ok(Ok(_)) => {}
+                    Ok(Err(_)) => tokio::time::sleep(Duration::from_millis(50)).await,
+                    Err(_elapsed) => {}
+                }
+                if Instant::now() >= deadline {
+                    return Err(SparkplugError::Transport(
+                        "timed out waiting for CONNACK".to_owned(),
+                    ));
+                }
+            }
+
+            self.client = Some(client);
+            self.eventloop = Some(eventloop);
+            Ok(())
+        }
+
+        async fn subscribe(&mut self, topic_filter: &str, qos: Qos) -> Result<()> {
+            self.client()?
+                .subscribe(topic_filter, to_rumqtt_qos(qos))
+                .await
+                .map_err(transport_err)
+        }
+
+        async fn publish(&mut self, message: &OutboundMessage) -> Result<()> {
+            self.client()?
+                .publish(
+                    message.topic.clone(),
+                    to_rumqtt_qos(message.qos),
+                    message.retain,
+                    message.payload.to_vec(),
+                )
+                .await
+                .map_err(transport_err)
+        }
+
+        async fn disconnect(&mut self) -> Result<()> {
+            if let Some(client) = &self.client {
+                client.disconnect().await.map_err(transport_err)?;
+            }
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> Result<Option<IncomingMessage>> {
+            let eventloop = self
+                .eventloop
+                .as_mut()
+                .ok_or_else(|| SparkplugError::Transport("not connected".to_owned()))?;
+            loop {
+                match eventloop.poll().await {
+                    Ok(Event::Incoming(Incoming::Publish(publish))) => {
+                        let topic = String::from_utf8(publish.topic.to_vec())
+                            .map_err(|_| SparkplugError::InvalidUtf8)?;
+                        return Ok(Some(IncomingMessage {
+                            topic,
+                            payload: bytes::Bytes::from(publish.payload.to_vec()),
+                        }));
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Err(transport_err(e)),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "transport-rumqttc")]
+pub use rumqtt_impl::RumqttcTransport;
