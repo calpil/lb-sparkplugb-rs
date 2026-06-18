@@ -23,7 +23,8 @@ hand-written (no `protoc`/`prost-build`), so the only runtime dependencies are
 | Edge Node + Device lifecycle (async engine) | **Implemented** (Phase 2) |
 | Host Application + Primary Host (async engine) | **Implemented** (Phase 3) |
 | `rumqttc` transport (`transport-rumqttc`) + embedded-broker e2e (`sim`) | **Implemented** (Phase 4) |
-| TLS/mTLS wiring + multi-server HA | Roadmap |
+| TLS / mTLS (`tls` feature) + mTLS e2e | **Implemented** |
+| Multi-server HA + sequence reorder buffer | Roadmap |
 
 See `../docs/plan-lb-sparkplugb-rs-sparkplug-b.md` for the full plan, and
 `../docs/sparkplug-b-normative-statements.md` for the conformance catalog.
