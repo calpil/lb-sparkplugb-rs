@@ -51,6 +51,7 @@ pub use codec::{EncodeOptions, decode, encode};
 pub use datatype::DataType;
 pub use edge::{DataSource, EdgeEvent, EdgeNode, EdgeNodeConfig, EdgeState};
 pub use error::{Result, SparkplugError};
+pub use host::{HostApplication, HostConfig, HostEvent};
 pub use model::{
     DataSet, MetaData, Metric, Parameter, Payload, PropertySet, PropertySetList, Template,
 };
