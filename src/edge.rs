@@ -36,6 +36,18 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Stamp every metric lacking a timestamp with `ts`. The spec requires a
+/// per-metric timestamp on every NBIRTH/DBIRTH/NDATA/DDATA metric
+/// (`tck-id-payloads-name-birth-data-requirement`), and some hosts (e.g. srad)
+/// reject an NBIRTH whose metrics are unstamped.
+fn stamp(metrics: &mut [Metric], ts: u64) {
+    for metric in metrics.iter_mut() {
+        if metric.timestamp.is_none() {
+            metric.timestamp = Some(ts);
+        }
+    }
+}
+
 /// Edge Node lifecycle state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EdgeState {
@@ -139,6 +151,7 @@ pub struct EdgeNode<T, S> {
     next_alias: u64,
     born_devices: Vec<String>,
     last_rebirth: Option<Instant>,
+    last_state_ts: Option<i64>,
     state: EdgeState,
 }
 
@@ -155,6 +168,7 @@ impl<T: MqttTransport, S: BdSeqStore> EdgeNode<T, S> {
             next_alias: 0,
             born_devices: Vec::new(),
             last_rebirth: None,
+            last_state_ts: None,
             state: EdgeState::Disconnected,
         }
     }
@@ -192,12 +206,15 @@ impl<T: MqttTransport, S: BdSeqStore> EdgeNode<T, S> {
 
     /// The NDEATH payload (a single `bdSeq` INT64 metric).
     fn ndeath_payload(&self) -> Payload {
+        let ts = now_ms();
+        let mut metrics = vec![Metric::new(
+            BDSEQ_METRIC_NAME,
+            MetricValue::Int64(i64::from(self.bd_seq)),
+        )];
+        stamp(&mut metrics, ts);
         Payload {
-            timestamp: Some(now_ms()),
-            metrics: vec![Metric::new(
-                BDSEQ_METRIC_NAME,
-                MetricValue::Int64(i64::from(self.bd_seq)),
-            )],
+            timestamp: Some(ts),
+            metrics,
             seq: None, // NDEATH carries no sequence number
             uuid: None,
             body: None,
@@ -251,15 +268,18 @@ impl<T: MqttTransport, S: BdSeqStore> EdgeNode<T, S> {
         };
         self.transport.connect(&opts).await?;
 
+        // NCMD/DCMD subscriptions MUST be QoS 1 so rebirth/command requests are
+        // not silently dropped (tck-id-message-flow-edge-node-ncmd-subscribe,
+        // tck-id-message-flow-device-dcmd-subscribe).
         let ncmd_topic = self.node_topic(MessageType::NCmd);
         self.transport
-            .subscribe(&ncmd_topic, Qos::AtMostOnce)
+            .subscribe(&ncmd_topic, Qos::AtLeastOnce)
             .await?;
         let devices = self.config.devices.clone();
         for device in &devices {
             let dcmd_topic = self.device_topic(device, MessageType::DCmd);
             self.transport
-                .subscribe(&dcmd_topic, Qos::AtMostOnce)
+                .subscribe(&dcmd_topic, Qos::AtLeastOnce)
                 .await?;
         }
 
@@ -287,9 +307,11 @@ impl<T: MqttTransport, S: BdSeqStore> EdgeNode<T, S> {
         }
         self.born_devices.clear();
 
-        let metrics = self.build_node_birth_metrics(source);
+        let ts = now_ms();
+        let mut metrics = self.build_node_birth_metrics(source);
+        stamp(&mut metrics, ts);
         let payload = Payload {
-            timestamp: Some(now_ms()),
+            timestamp: Some(ts),
             metrics,
             seq: Some(self.seq.next_value()), // NBIRTH carries seq = 0
             uuid: None,
@@ -341,10 +363,12 @@ impl<T: MqttTransport, S: BdSeqStore> EdgeNode<T, S> {
         source: &D,
         device: &DeviceId,
     ) -> Result<()> {
+        let ts = now_ms();
         let mut metrics = source.device_birth_metrics(device.as_str());
         self.assign_aliases(&mut metrics);
+        stamp(&mut metrics, ts);
         let payload = Payload {
-            timestamp: Some(now_ms()),
+            timestamp: Some(ts),
             metrics,
             seq: Some(self.seq.next_value()),
             uuid: None,
@@ -414,9 +438,11 @@ impl<T: MqttTransport, S: BdSeqStore> EdgeNode<T, S> {
                 "cannot publish NDATA before NBIRTH".to_owned(),
             ));
         }
-        let data = self.to_data_metrics(metrics);
+        let ts = now_ms();
+        let mut data = self.to_data_metrics(metrics);
+        stamp(&mut data, ts);
         let payload = Payload {
-            timestamp: Some(now_ms()),
+            timestamp: Some(ts),
             metrics: data,
             seq: Some(self.seq.next_value()),
             uuid: None,
@@ -443,9 +469,11 @@ impl<T: MqttTransport, S: BdSeqStore> EdgeNode<T, S> {
             )));
         }
         let device_id = DeviceId::new(device)?;
-        let data = self.to_data_metrics(metrics);
+        let ts = now_ms();
+        let mut data = self.to_data_metrics(metrics);
+        stamp(&mut data, ts);
         let payload = Payload {
-            timestamp: Some(now_ms()),
+            timestamp: Some(ts),
             metrics: data,
             seq: Some(self.seq.next_value()),
             uuid: None,
@@ -459,6 +487,41 @@ impl<T: MqttTransport, S: BdSeqStore> EdgeNode<T, S> {
             false,
         )
         .await
+    }
+
+    /// Publish a DDEATH for a born device and mark it offline. DDEATH carries a
+    /// sequence number (`tck-id-payloads-ddeath-seq`) at QoS 0, retain=false.
+    ///
+    /// # Errors
+    /// Returns an error if the device is not born, or on transport failure.
+    pub async fn publish_device_death(&mut self, device: &str) -> Result<()> {
+        let pos = self
+            .born_devices
+            .iter()
+            .position(|d| d == device)
+            .ok_or_else(|| {
+                SparkplugError::InvalidTopic(format!(
+                    "device {device:?} is not born; cannot publish DDEATH"
+                ))
+            })?;
+        let device_id = DeviceId::new(device)?;
+        let payload = Payload {
+            timestamp: Some(now_ms()),
+            metrics: Vec::new(),
+            seq: Some(self.seq.next_value()),
+            uuid: None,
+            body: None,
+        };
+        let bytes = encode(&payload, EncodeOptions::birth());
+        self.publish_raw(
+            self.device_topic(&device_id, MessageType::DDeath),
+            bytes,
+            Qos::AtMostOnce,
+            false,
+        )
+        .await?;
+        self.born_devices.remove(pos);
+        Ok(())
     }
 
     fn rebirth_allowed(&self) -> bool {
@@ -522,8 +585,24 @@ impl<T: MqttTransport, S: BdSeqStore> EdgeNode<T, S> {
                     std::str::from_utf8(&message.payload)
                         .map_err(|_| SparkplugError::InvalidUtf8)?,
                 )?;
-                if state.online && self.state == EdgeState::WaitingForPrimaryHost {
-                    self.publish_birth_sequence(source).await?;
+                // Ignore a STATE older than the last accepted one (the edge
+                // drops stale/out-of-order primary-host STATE messages).
+                if self
+                    .last_state_ts
+                    .is_some_and(|last| state.timestamp < last)
+                {
+                    return Ok(EdgeEvent::Ignored);
+                }
+                self.last_state_ts = Some(state.timestamp);
+                if state.online {
+                    if self.state == EdgeState::WaitingForPrimaryHost {
+                        self.publish_birth_sequence(source).await?;
+                    }
+                } else if self.state == EdgeState::Online {
+                    // Primary host went offline: terminate this session (a
+                    // graceful disconnect publishes NDEATH first). Re-homing to
+                    // another MQTT server is the Phase 4 multi-server concern.
+                    self.disconnect().await?;
                 }
                 Ok(EdgeEvent::PrimaryHostState(state))
             }
