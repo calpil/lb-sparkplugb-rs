@@ -29,6 +29,8 @@ flate2 = { version = "1", optional = true }
 [dev-dependencies]
 # Property-based round-trip tests of the codec.
 proptest = "1"
+# Drives the async Edge Node engine tests (an in-memory transport, no broker).
+tokio = { version = "1", features = ["macros", "rt"] }
 
 [lints.rust]
 # The whole crate is safe Rust; the codec never needs unsafe and never panics on input.

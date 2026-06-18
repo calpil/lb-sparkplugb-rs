@@ -84,6 +84,16 @@ pub trait BdSeqStore {
     fn store_next_death(&self, value: u8) -> std::io::Result<()>;
 }
 
+/// A shared reference to a store is itself a store (the methods take `&self`).
+impl<B: BdSeqStore + ?Sized> BdSeqStore for &B {
+    fn load_next_death(&self) -> std::io::Result<u8> {
+        (**self).load_next_death()
+    }
+    fn store_next_death(&self, value: u8) -> std::io::Result<()> {
+        (**self).store_next_death(value)
+    }
+}
+
 /// An in-memory bdSeq store (non-persistent; useful for tests and ephemeral nodes).
 #[derive(Debug, Default)]
 pub struct InMemoryBdSeqStore {

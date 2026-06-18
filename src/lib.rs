@@ -49,6 +49,7 @@ pub mod compress;
 pub use alias::{AliasRegistry, MetricKey};
 pub use codec::{EncodeOptions, decode, encode};
 pub use datatype::DataType;
+pub use edge::{DataSource, EdgeEvent, EdgeNode, EdgeNodeConfig, EdgeState};
 pub use error::{Result, SparkplugError};
 pub use model::{
     DataSet, MetaData, Metric, Parameter, Payload, PropertySet, PropertySetList, Template,
@@ -56,6 +57,9 @@ pub use model::{
 pub use sequence::{BdSeq, BdSeqStore, FileBdSeqStore, InMemoryBdSeqStore, Seq};
 pub use state::StatePayload;
 pub use topic::{DeviceId, EdgeNodeId, GroupId, MessageType, SparkplugTopic};
+pub use transport::{
+    ConnectOptions, IncomingMessage, MqttTransport, OutboundMessage, Qos, TlsConfig,
+};
 pub use value::{DataSetValue, MetricValue, ParameterValue, PropertyValue};
 
 /// The Sparkplug B namespace token (`spBv1.0`, `tck-id-topic-structure-namespace-a`).
