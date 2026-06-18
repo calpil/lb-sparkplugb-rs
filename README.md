@@ -1,20 +1,70 @@
-# Introduction 
-TODO: Give a short introduction of your project. Let this section explain the objectives or the motivation behind this project. 
+# lb-sparkplugb-rs (`sparkplug_b`)
 
-# Getting Started
-TODO: Guide users through getting your code up and running on their own system. In this section you can talk about:
-1.	Installation process
-2.	Software dependencies
-3.	Latest releases
-4.	API references
+A standalone, spec-driven Rust implementation of the
+[Eclipse Sparkplug B 3.0.0](https://sparkplug.eclipse.org/specification/version/3.0/)
+specification: the wire payload model + codec, the topic namespace, the
+sequence/`bdSeq` machinery, and (phased) the Edge Node and Host Application roles.
 
-# Build and Test
-TODO: Describe and show how to build your code and run the tests. 
+The crate has **no dependency** on any SCADA framework. The protobuf codec is
+hand-written (no `protoc`/`prost-build`), so the only runtime dependencies are
+`bytes` and `thiserror` (plus optional `flate2` for the compression feature).
 
-# Contribute
-TODO: Explain how other users and developers can contribute to make your code better. 
+## Status
 
-If you want to learn more about creating good readme files then refer the following [guidelines](https://docs.microsoft.com/en-us/azure/devops/repos/git/create-a-readme?view=azure-devops). You can also seek inspiration from the below readme files:
-- [ASP.NET Core](https://github.com/aspnet/Home)
-- [Visual Studio Code](https://github.com/Microsoft/vscode)
-- [Chakra Core](https://github.com/Microsoft/ChakraCore)
+| Layer | Status |
+|-------|--------|
+| Payload model + DataTypes | **Implemented** (Phase 1) |
+| Proto2 codec (encode/decode, arrays, null, strip-datatypes) | **Implemented** (Phase 1) |
+| Topic namespace + message types + validated IDs | **Implemented** (Phase 1) |
+| Sequence (`seq`) + `bdSeq` + persistence | **Implemented** (Phase 1) |
+| Alias registry | **Implemented** (Phase 1) |
+| STATE payload | **Implemented** (Phase 1) |
+| Compression envelope (`compression` feature) | **Implemented** (Phase 1) |
+| Edge Node + Device lifecycle | Designed + scaffolded (Phase 2) |
+| Host Application + Primary Host | Designed + scaffolded (Phase 3) |
+| MQTT transport (rumqttc) + TLS + HA | Designed + scaffolded (Phase 4) |
+
+See `../docs/plan-lb-sparkplugb-rs-sparkplug-b.md` for the full plan, and
+`../docs/sparkplug-b-normative-statements.md` for the conformance catalog.
+
+## Example
+
+```rust
+use sparkplug_b::{decode, encode, EncodeOptions, Metric, MetricValue, Payload};
+
+let payload = Payload::new()
+    .with_timestamp(1_700_000_000_000)
+    .with_seq(0)
+    .with_metric(Metric::new("Temperature", MetricValue::Double(21.5)));
+
+let bytes = encode(&payload, EncodeOptions::birth());
+let decoded = decode(&bytes, None).unwrap();
+assert_eq!(decoded, payload);
+```
+
+```sh
+cargo run --example encode_nbirth
+```
+
+## Build & test
+
+```sh
+cargo build --all-features
+cargo test  --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --check
+```
+
+## Design notes
+
+- **Tagged-enum values** (`MetricValue`) make type/value mismatch unrepresentable.
+- **Topic is an enum** (`Node | Device | HostState`); one canonical parser.
+- **seq/bdSeq are `u8`** — `wrapping_add` gives the spec's `255 -> 0` wrap.
+- **Decoding never panics** on hostile input — every failure is a typed
+  `SparkplugError`; arbitrary-bytes fuzzing is a property test.
+
+## Licensing
+
+This implementation is original (`Apache-2.0 OR MIT`). It is informed by the
+Eclipse Tahu reference implementation (EPL-2.0) but copies no Tahu source; the
+Sparkplug protobuf schema (field numbers / enum values) is factual.

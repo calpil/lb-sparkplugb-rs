@@ -2,5 +2,38 @@
 name = "lb-sparkplugb-rs"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0 OR MIT"
+description = "Eclipse Sparkplug B 3.0.0 protocol library — payload codec, topic namespace, sequence/bdSeq, and (phased) edge & host roles, in Rust."
+readme = "README.md"
+keywords = ["sparkplug", "mqtt", "iiot", "scada", "protobuf"]
+categories = ["network-programming", "encoding"]
+
+# Ergonomic import path: `use sparkplug_b::...` even though the package is `lb-sparkplugb-rs`.
+[lib]
+name = "sparkplug_b"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Optional DEFLATE/GZIP payload envelope (uuid == "SPBV1.0_COMPRESSED").
+compression = ["dep:flate2"]
 
 [dependencies]
+# Zero-copy buffers for payload body / bytes_value / packed arrays.
+bytes = "1"
+# Library-grade structured error type (Rust API guidelines / rust-best-practices).
+thiserror = "2"
+# Payload compression (optional, non-standard but supported by the Tahu/spec envelope).
+flate2 = { version = "1", optional = true }
+
+[dev-dependencies]
+# Property-based round-trip tests of the codec.
+proptest = "1"
+
+[lints.rust]
+# The whole crate is safe Rust; the codec never needs unsafe and never panics on input.
+unsafe_code = "forbid"
+
+[[example]]
+name = "encode_nbirth"
+path = "examples/encode_nbirth.rs"
