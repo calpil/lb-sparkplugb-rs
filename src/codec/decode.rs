@@ -57,6 +57,14 @@ fn mismatch(msg: impl Into<String>) -> SparkplugError {
     SparkplugError::ValueTypeMismatch(msg.into())
 }
 
+/// Read a datatype / type-code varint. A value that does not fit in `u32` can
+/// never be a valid Sparkplug datatype code, so reject it rather than letting
+/// `as u32` silently alias it onto a small valid code.
+fn read_type_code(r: &mut Reader<'_>) -> Result<u32> {
+    let raw = r.read_varint()?;
+    u32::try_from(raw).map_err(|_| SparkplugError::UnknownDataType(raw as u32))
+}
+
 fn decode_metric(bytes: &[u8], types: Option<&AliasRegistry>, depth: usize) -> Result<Metric> {
     if depth > MAX_DEPTH {
         return Err(SparkplugError::RecursionLimit);
@@ -79,7 +87,7 @@ fn decode_metric(bytes: &[u8], types: Option<&AliasRegistry>, depth: usize) -> R
             (1, WIRE_LEN) => name = Some(r.read_string()?),
             (2, WIRE_VARINT) => alias = Some(r.read_varint()?),
             (3, WIRE_VARINT) => timestamp = Some(r.read_varint()?),
-            (4, WIRE_VARINT) => datatype = Some(r.read_varint()? as u32),
+            (4, WIRE_VARINT) => datatype = Some(read_type_code(&mut r)?),
             (5, WIRE_VARINT) => is_historical = Some(r.read_varint()? != 0),
             (6, WIRE_VARINT) => is_transient = Some(r.read_varint()? != 0),
             (7, WIRE_VARINT) => is_null = r.read_varint()? != 0,
@@ -286,7 +294,7 @@ fn decode_propertyvalue(bytes: &[u8], depth: usize) -> Result<PropertyValue> {
     while !r.is_empty() {
         let (field, wire) = r.read_tag()?;
         match (field, wire) {
-            (1, WIRE_VARINT) => type_code = Some(r.read_varint()? as u32),
+            (1, WIRE_VARINT) => type_code = Some(read_type_code(&mut r)?),
             (2, WIRE_VARINT) => is_null = r.read_varint()? != 0,
             (3, WIRE_VARINT) => int_v = Some(r.read_varint()? as u32),
             (4, WIRE_VARINT) => long_v = Some(r.read_varint()?),
@@ -365,12 +373,12 @@ fn decode_dataset(bytes: &[u8]) -> Result<DataSet> {
                 r.read_varint()?; // num_of_columns — derived from columns.len() instead
             }
             (2, WIRE_LEN) => columns.push(r.read_string()?),
-            (3, WIRE_VARINT) => type_codes.push(r.read_varint()? as u32),
+            (3, WIRE_VARINT) => type_codes.push(read_type_code(&mut r)?),
             (3, WIRE_LEN) => {
                 // Packed repeated `types` (proto3-style) — tolerate it.
                 let mut sub = Reader::new(r.read_len_slice()?);
                 while !sub.is_empty() {
-                    type_codes.push(sub.read_varint()? as u32);
+                    type_codes.push(read_type_code(&mut sub)?);
                 }
             }
             (4, WIRE_LEN) => row_slices.push(r.read_len_slice()?),
@@ -469,6 +477,13 @@ fn decode_datasetvalue(bytes: &[u8], dt: DataType) -> Result<DataSetValue> {
 }
 
 fn decode_template(bytes: &[u8], types: Option<&AliasRegistry>, depth: usize) -> Result<Template> {
+    // NOTE (Phase 3): member metrics are decoded with the same registry as the
+    // parent. A BIRTH carries member datatypes inline, so this is exact. Decoding
+    // a *stripped* (DATA) template instance whose members omit datatypes would
+    // require keying recovery by the Tahu "parent/child" prefixed name — that
+    // prefixing belongs to the host-side alias binding and is deferred to Phase 3.
+    // Until then, a stripped template member without an inline datatype yields a
+    // `MissingDataType` error rather than silently mis-decoding.
     if depth > MAX_DEPTH {
         return Err(SparkplugError::RecursionLimit);
     }
@@ -504,7 +519,7 @@ fn decode_parameter(bytes: &[u8]) -> Result<Parameter> {
         let (field, wire) = r.read_tag()?;
         match (field, wire) {
             (1, WIRE_LEN) => name = Some(r.read_string()?),
-            (2, WIRE_VARINT) => type_code = Some(r.read_varint()? as u32),
+            (2, WIRE_VARINT) => type_code = Some(read_type_code(&mut r)?),
             (3, WIRE_VARINT) => int_v = Some(r.read_varint()? as u32),
             (4, WIRE_VARINT) => long_v = Some(r.read_varint()?),
             (5, WIRE_I32) => float_v = Some(r.read_f32()?),

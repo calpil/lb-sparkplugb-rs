@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use crate::datatype::DataType;
+use crate::error::{Result, SparkplugError};
 
 /// A lookup key: either a metric name or an alias.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -37,7 +38,8 @@ impl AliasRegistry {
     }
 
     /// Bind a metric's name (and optional alias) to its datatype, as declared in
-    /// a BIRTH.
+    /// a BIRTH. Overwrites any existing binding for the same name/alias; use
+    /// [`AliasRegistry::try_bind`] to enforce the duplicate-alias-is-fatal rule.
     pub fn bind(&mut self, name: &str, alias: Option<u64>, datatype: DataType) {
         self.dt_by_name.insert(name.to_owned(), datatype);
         if let Some(alias) = alias {
@@ -45,6 +47,25 @@ impl AliasRegistry {
             self.alias_to_name.insert(alias, name.to_owned());
             self.dt_by_alias.insert(alias, datatype);
         }
+    }
+
+    /// Like [`AliasRegistry::bind`], but rejects an alias already bound to a
+    /// different name — a duplicate alias in a BIRTH is fatal per the spec.
+    ///
+    /// # Errors
+    /// Returns [`SparkplugError::InvalidId`] if `alias` is already bound to a
+    /// different metric name.
+    pub fn try_bind(&mut self, name: &str, alias: Option<u64>, datatype: DataType) -> Result<()> {
+        if let Some(alias) = alias
+            && let Some(existing) = self.alias_to_name.get(&alias)
+            && existing != name
+        {
+            return Err(SparkplugError::InvalidId(format!(
+                "alias {alias} already bound to {existing:?}, cannot rebind to {name:?}"
+            )));
+        }
+        self.bind(name, alias, datatype);
+        Ok(())
     }
 
     /// The datatype declared for `name`, if any.

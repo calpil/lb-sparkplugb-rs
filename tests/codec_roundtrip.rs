@@ -1,15 +1,17 @@
 //! Property-based round-trip tests: `decode(encode(p)) == p` across every
-//! datatype, plus a "decode never panics on arbitrary bytes" property.
+//! scalar/array datatype, a stripped-DATA + `AliasRegistry` recovery round-trip,
+//! and a "decode never panics on arbitrary bytes" property.
 //!
 //! Strategies are grammatical (valid payloads), not `.*` over the wire — the
 //! lesson from the SCADA project's parser-fuzzing work (feat#23). NaN floats are
 //! excluded because `PartialEq` is not reflexive for NaN (the round-trip
-//! preserves the bits regardless).
+//! preserves the bits regardless). Composite types (DataSet/Template/PropertySet)
+//! are covered by deterministic round-trips in `composites.rs`.
 
 use bytes::Bytes;
 use proptest::prelude::*;
 use sparkplug_b::value::MetricValue;
-use sparkplug_b::{DataType, EncodeOptions, Metric, Payload, decode, encode};
+use sparkplug_b::{AliasRegistry, DataType, EncodeOptions, Metric, Payload, decode, encode};
 
 fn finite_f32() -> impl Strategy<Value = f32> {
     any::<f32>().prop_filter("exclude NaN", |f| !f.is_nan())
@@ -57,8 +59,6 @@ fn valid_metric_datatype() -> impl Strategy<Value = DataType> {
 }
 
 fn metric_value() -> impl Strategy<Value = MetricValue> {
-    // Strings without embedded NUL where NUL is significant (StringArray uses it
-    // as a terminator); scalar String may contain anything.
     let small = 0usize..12;
     prop_oneof![
         any::<i8>().prop_map(MetricValue::Int8),
@@ -135,6 +135,34 @@ fn payload() -> impl Strategy<Value = Payload> {
         })
 }
 
+/// A payload of named+aliased metrics with unique names, suitable for the
+/// strip-and-recover path (an `AliasRegistry` is built from these metrics).
+fn recoverable_payload() -> impl Strategy<Value = Payload> {
+    prop::collection::vec((any::<u64>(), metric_value()), 0..6).prop_map(|items| {
+        let metrics = items
+            .into_iter()
+            .enumerate()
+            .map(|(i, (alias, value))| Metric {
+                name: Some(format!("m{i}")), // unique names so name-based recovery is unambiguous
+                alias: Some(alias),
+                timestamp: None,
+                value,
+                is_historical: None,
+                is_transient: None,
+                metadata: None,
+                properties: None,
+            })
+            .collect();
+        Payload {
+            timestamp: Some(1),
+            metrics,
+            seq: Some(0),
+            uuid: None,
+            body: None,
+        }
+    })
+}
+
 proptest! {
     /// Encoding with datatypes included (BIRTH) and decoding without a registry
     /// reproduces the original payload exactly.
@@ -142,6 +170,19 @@ proptest! {
     fn birth_roundtrip(p in payload()) {
         let bytes = encode(&p, EncodeOptions::birth());
         let decoded = decode(&bytes, None)?;
+        prop_assert_eq!(decoded, p);
+    }
+
+    /// Encoding with datatypes stripped (DATA) and decoding with an AliasRegistry
+    /// built from the metrics recovers every datatype and reproduces the payload.
+    #[test]
+    fn data_roundtrip_with_registry(p in recoverable_payload()) {
+        let mut reg = AliasRegistry::new();
+        for m in &p.metrics {
+            reg.bind(m.name.as_deref().unwrap(), m.alias, m.value.datatype());
+        }
+        let bytes = encode(&p, EncodeOptions::data());
+        let decoded = decode(&bytes, Some(&reg))?;
         prop_assert_eq!(decoded, p);
     }
 

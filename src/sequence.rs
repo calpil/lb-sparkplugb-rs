@@ -142,7 +142,16 @@ impl BdSeqStore for FileBdSeqStore {
     }
 
     fn store_next_death(&self, value: u8) -> std::io::Result<()> {
-        let tmp = self.path.with_extension("tmp");
+        // Derive the temp name from the full file name plus the PID so sibling
+        // stores (or processes) never collide on a shared `.tmp` path.
+        let file_name = self
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "bdseq".to_owned());
+        let tmp = self
+            .path
+            .with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
         std::fs::write(&tmp, value.to_string())?;
         std::fs::rename(&tmp, &self.path)
     }

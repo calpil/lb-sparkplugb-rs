@@ -64,3 +64,26 @@ fn device_message_types_carry_device_and_seq_rules() {
     assert!(MessageType::DDeath.carries_seq());
     assert!(MessageType::NBirth.carries_seq());
 }
+
+#[test]
+fn rejects_state_topic_with_extra_token() {
+    assert!(SparkplugTopic::parse("spBv1.0/STATE/host/extra").is_err());
+}
+
+#[test]
+fn parse_format_round_trips_for_all_topic_shapes() {
+    for topic in [
+        "spBv1.0/G/NBIRTH/E",
+        "spBv1.0/G/NDEATH/E",
+        "spBv1.0/G/NDATA/E",
+        "spBv1.0/G/NCMD/E",
+        "spBv1.0/G/DBIRTH/E/D",
+        "spBv1.0/G/DDEATH/E/D",
+        "spBv1.0/G/DDATA/E/D",
+        "spBv1.0/G/DCMD/E/D",
+        "spBv1.0/STATE/host",
+    ] {
+        let parsed = SparkplugTopic::parse(topic).expect("valid topic");
+        assert_eq!(parsed.to_string(), topic, "round-trip for {topic}");
+    }
+}

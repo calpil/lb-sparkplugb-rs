@@ -5,6 +5,7 @@
 use bytes::Bytes;
 
 use crate::datatype::DataType;
+use crate::error::{Result, SparkplugError};
 use crate::model::{DataSet, PropertySet, PropertySetList, Template};
 
 /// The value carried by a [`crate::model::Metric`].
@@ -98,6 +99,22 @@ impl MetricValue {
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null(_))
     }
+
+    /// Construct a checked null value, rejecting datatypes that are invalid for
+    /// a metric (`Unknown`, and the property-only `PropertySet`/`PropertySetList`).
+    /// This prevents emitting a non-conformant `datatype` field on the wire.
+    ///
+    /// # Errors
+    /// Returns [`SparkplugError::ValueTypeMismatch`] if `dt` is not a valid
+    /// metric datatype.
+    pub fn null(dt: DataType) -> Result<Self> {
+        match dt {
+            DataType::Unknown | DataType::PropertySet | DataType::PropertySetList => Err(
+                SparkplugError::ValueTypeMismatch(format!("{dt:?} is not a valid metric datatype")),
+            ),
+            _ => Ok(Self::Null(dt)),
+        }
+    }
 }
 
 /// A single cell value inside a [`DataSet`] row. Only basic scalar types are
@@ -120,6 +137,37 @@ pub enum DataSetValue {
     Text(String),
     DateTime(i64),
     Null,
+}
+
+impl DataSetValue {
+    /// The Sparkplug [`DataType`] this cell declares, or `None` for `Null`.
+    #[must_use]
+    pub fn datatype(&self) -> Option<DataType> {
+        let dt = match self {
+            Self::Int8(_) => DataType::Int8,
+            Self::Int16(_) => DataType::Int16,
+            Self::Int32(_) => DataType::Int32,
+            Self::Int64(_) => DataType::Int64,
+            Self::UInt8(_) => DataType::UInt8,
+            Self::UInt16(_) => DataType::UInt16,
+            Self::UInt32(_) => DataType::UInt32,
+            Self::UInt64(_) => DataType::UInt64,
+            Self::Float(_) => DataType::Float,
+            Self::Double(_) => DataType::Double,
+            Self::Boolean(_) => DataType::Boolean,
+            Self::String(_) => DataType::String,
+            Self::Text(_) => DataType::Text,
+            Self::DateTime(_) => DataType::DateTime,
+            Self::Null => return None,
+        };
+        Some(dt)
+    }
+
+    /// Whether this cell is null (unset value oneof on the wire).
+    #[must_use]
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
 }
 
 /// A value inside a [`PropertySet`] — basic scalars plus recursive property sets.
@@ -191,4 +239,27 @@ pub enum ParameterValue {
     String(String),
     Text(String),
     DateTime(i64),
+}
+
+impl ParameterValue {
+    /// The Sparkplug [`DataType`] this parameter value declares on the wire.
+    #[must_use]
+    pub fn datatype(&self) -> DataType {
+        match self {
+            Self::Int8(_) => DataType::Int8,
+            Self::Int16(_) => DataType::Int16,
+            Self::Int32(_) => DataType::Int32,
+            Self::Int64(_) => DataType::Int64,
+            Self::UInt8(_) => DataType::UInt8,
+            Self::UInt16(_) => DataType::UInt16,
+            Self::UInt32(_) => DataType::UInt32,
+            Self::UInt64(_) => DataType::UInt64,
+            Self::Float(_) => DataType::Float,
+            Self::Double(_) => DataType::Double,
+            Self::Boolean(_) => DataType::Boolean,
+            Self::String(_) => DataType::String,
+            Self::Text(_) => DataType::Text,
+            Self::DateTime(_) => DataType::DateTime,
+        }
+    }
 }

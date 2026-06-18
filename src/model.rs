@@ -251,6 +251,17 @@ impl DataSet {
                     columns.len()
                 )));
             }
+            // Each non-null cell's type must match its column type, so a value
+            // can never be decoded under a different type than it was built with.
+            for (col, (cell, col_ty)) in row.iter().zip(&types).enumerate() {
+                if let Some(cell_ty) = cell.datatype()
+                    && cell_ty != *col_ty
+                {
+                    return Err(SparkplugError::DataSetShape(format!(
+                        "row {i} column {col}: cell type {cell_ty:?} does not match column type {col_ty:?}"
+                    )));
+                }
+            }
         }
         Ok(Self {
             columns,
