@@ -58,6 +58,8 @@ pub use model::{
 pub use sequence::{BdSeq, BdSeqStore, FileBdSeqStore, InMemoryBdSeqStore, Seq};
 pub use state::StatePayload;
 pub use topic::{DeviceId, EdgeNodeId, GroupId, MessageType, SparkplugTopic};
+#[cfg(feature = "transport-rumqttc")]
+pub use transport::RumqttcTransport;
 pub use transport::{
     ConnectOptions, IncomingMessage, MqttTransport, OutboundMessage, Qos, TlsConfig,
 };

@@ -20,9 +20,11 @@ hand-written (no `protoc`/`prost-build`), so the only runtime dependencies are
 | Alias registry | **Implemented** (Phase 1) |
 | STATE payload | **Implemented** (Phase 1) |
 | Compression envelope (`compression` feature) | **Implemented** (Phase 1) |
-| Edge Node + Device lifecycle | Designed + scaffolded (Phase 2) |
-| Host Application + Primary Host | Designed + scaffolded (Phase 3) |
-| MQTT transport (rumqttc) + TLS + HA | Designed + scaffolded (Phase 4) |
+| Edge Node + Device lifecycle (async engine) | **Implemented** (Phase 2) |
+| Host Application + Primary Host (async engine) | **Implemented** (Phase 3) |
+| `rumqttc` transport (`transport-rumqttc`) + embedded-broker e2e (`sim`) | **Implemented** (Phase 4) |
+| TLS / mTLS (`tls` feature) + mTLS e2e | **Implemented** |
+| Multi-server HA + sequence reorder buffer | Roadmap |
 
 See `../docs/plan-lb-sparkplugb-rs-sparkplug-b.md` for the full plan, and
 `../docs/sparkplug-b-normative-statements.md` for the conformance catalog.

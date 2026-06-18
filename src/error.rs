@@ -73,4 +73,8 @@ pub enum SparkplugError {
     /// An I/O error from bdSeq persistence.
     #[error("bdSeq store I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// An MQTT transport error (connect/subscribe/publish/receive).
+    #[error("MQTT transport error: {0}")]
+    Transport(String),
 }
