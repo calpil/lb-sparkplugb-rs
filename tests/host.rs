@@ -400,3 +400,224 @@ async fn rebirth_requests_are_debounced() {
         .count();
     assert_eq!(ncmds, 1, "only one rebirth NCMD published");
 }
+
+// ---- review-driven additions --------------------------------------------
+
+#[tokio::test]
+async fn node_death_surfaces_affected_devices_and_timestamp() {
+    let (mut host, _shared) = started().await;
+    host.handle_incoming(&msg("spBv1.0/G/NBIRTH/E", nbirth(5, false)))
+        .await
+        .unwrap();
+    host.handle_incoming(&msg("spBv1.0/G/DBIRTH/E/dev1", dbirth(1)))
+        .await
+        .unwrap();
+
+    match host
+        .handle_incoming(&msg("spBv1.0/G/NDEATH/E", ndeath(5)))
+        .await
+        .unwrap()
+    {
+        HostEvent::NodeDeath {
+            devices, timestamp, ..
+        } => {
+            assert_eq!(
+                devices,
+                vec!["dev1".to_owned()],
+                "the online device is surfaced as stale"
+            );
+            assert_eq!(timestamp, 1, "the NDEATH payload timestamp is surfaced");
+        }
+        other => panic!("expected NodeDeath, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn device_death_surfaces_timestamp() {
+    let (mut host, _shared) = started().await;
+    host.handle_incoming(&msg("spBv1.0/G/NBIRTH/E", nbirth(5, false)))
+        .await
+        .unwrap();
+    host.handle_incoming(&msg("spBv1.0/G/DBIRTH/E/dev1", dbirth(1)))
+        .await
+        .unwrap();
+
+    match host
+        .handle_incoming(&msg("spBv1.0/G/DDEATH/E/dev1", ddeath(2)))
+        .await
+        .unwrap()
+    {
+        HostEvent::DeviceDeath { timestamp, .. } => assert_eq!(timestamp, 1),
+        other => panic!("expected DeviceDeath, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn ndeath_without_bdseq_is_ignored() {
+    let nbirth_no_bdseq = {
+        let p = Payload::new()
+            .with_seq(0)
+            .with_metric(Metric::new("Temperature", MetricValue::Double(20.0)))
+            .with_metric(Metric::new(
+                NODE_CONTROL_REBIRTH,
+                MetricValue::Boolean(false),
+            ));
+        encode(&p, EncodeOptions::birth())
+    };
+    let ndeath_no_bdseq = {
+        let p = Payload {
+            timestamp: Some(1),
+            metrics: Vec::new(),
+            seq: None,
+            uuid: None,
+            body: None,
+        };
+        encode(&p, EncodeOptions::birth())
+    };
+    let (mut host, _shared) = started().await;
+    host.handle_incoming(&msg("spBv1.0/G/NBIRTH/E", nbirth_no_bdseq))
+        .await
+        .unwrap();
+    // Both sides omit bdSeq -> the None==None match must NOT honor the death.
+    let event = host
+        .handle_incoming(&msg("spBv1.0/G/NDEATH/E", ndeath_no_bdseq))
+        .await
+        .unwrap();
+    assert!(matches!(event, HostEvent::Ignored));
+}
+
+#[tokio::test]
+async fn duplicate_alias_birth_invalidates_session_until_rebirth() {
+    let dup = {
+        let p = Payload::new()
+            .with_seq(0)
+            .with_metric(Metric::new("A", MetricValue::Int32(1)).with_alias(0))
+            .with_metric(Metric::new("B", MetricValue::Int32(2)).with_alias(0))
+            .with_metric(Metric::new(BDSEQ_METRIC_NAME, MetricValue::Int64(5)));
+        encode(&p, EncodeOptions::birth())
+    };
+    let (mut host, _shared) = started().await;
+    let birth = host
+        .handle_incoming(&msg("spBv1.0/G/NBIRTH/E", dup))
+        .await
+        .unwrap();
+    assert!(matches!(birth, HostEvent::RebirthRequested { .. }));
+
+    let data = host
+        .handle_incoming(&msg("spBv1.0/G/NDATA/E", ndata(1, false, 1.0)))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            data,
+            HostEvent::RebirthRequested { .. } | HostEvent::Ignored
+        ),
+        "NDATA against an invalidated session must not be emitted as NodeData"
+    );
+}
+
+#[tokio::test]
+async fn malformed_in_session_data_routes_to_rebirth_not_err() {
+    let (mut host, _shared) = started().await;
+    host.handle_incoming(&msg("spBv1.0/G/NBIRTH/E", nbirth(5, false)))
+        .await
+        .unwrap();
+    let result = host
+        .handle_incoming(&msg("spBv1.0/G/NDATA/E", Bytes::from_static(&[0x12, 0x05])))
+        .await;
+    assert!(matches!(result, Ok(HostEvent::RebirthRequested { .. })));
+}
+
+#[tokio::test]
+async fn re_nbirth_resets_an_already_online_session() {
+    let (mut host, _shared) = started().await;
+    host.handle_incoming(&msg("spBv1.0/G/NBIRTH/E", nbirth(5, false)))
+        .await
+        .unwrap();
+    host.handle_incoming(&msg("spBv1.0/G/NDATA/E", ndata(1, false, 1.0)))
+        .await
+        .unwrap();
+
+    host.handle_incoming(&msg("spBv1.0/G/NBIRTH/E", nbirth(6, false)))
+        .await
+        .unwrap();
+    let event = host
+        .handle_incoming(&msg("spBv1.0/G/NDATA/E", ndata(1, false, 2.0)))
+        .await
+        .unwrap();
+    assert!(
+        matches!(event, HostEvent::NodeData { .. }),
+        "session reset by the re-NBIRTH"
+    );
+}
+
+#[tokio::test]
+async fn device_birth_before_node_birth_requests_rebirth() {
+    let (mut host, _shared) = started().await;
+    let event = host
+        .handle_incoming(&msg("spBv1.0/G/DBIRTH/E/dev1", dbirth(1)))
+        .await
+        .unwrap();
+    assert!(matches!(event, HostEvent::RebirthRequested { .. }));
+}
+
+#[tokio::test]
+async fn publish_node_and_device_commands() {
+    let (mut host, shared) = started().await;
+    host.publish_node_command(
+        "G",
+        "E",
+        vec![Metric::new("Output", MetricValue::Boolean(true))],
+    )
+    .await
+    .unwrap();
+    host.publish_device_command(
+        "G",
+        "E",
+        "dev1",
+        vec![Metric::new("SP", MetricValue::Double(5.0))],
+    )
+    .await
+    .unwrap();
+
+    let s = shared.lock().unwrap();
+    let ncmd = s
+        .published
+        .iter()
+        .find(|m| m.topic == "spBv1.0/G/NCMD/E")
+        .expect("NCMD published");
+    assert_eq!(ncmd.qos, Qos::AtMostOnce);
+    assert!(!ncmd.retain);
+    let decoded = sparkplug_b::decode(&ncmd.payload, None).unwrap();
+    assert_eq!(decoded.metrics[0].name.as_deref(), Some("Output"));
+    assert_eq!(decoded.metrics[0].value, MetricValue::Boolean(true));
+
+    let dcmd = s
+        .published
+        .iter()
+        .find(|m| m.topic == "spBv1.0/G/DCMD/E/dev1")
+        .expect("DCMD published");
+    assert_eq!(dcmd.qos, Qos::AtMostOnce);
+    assert!(!dcmd.retain);
+}
+
+#[tokio::test]
+async fn malformed_birth_and_non_utf8_state_return_err_not_panic() {
+    let (mut host, _shared) = started().await;
+    assert!(
+        host.handle_incoming(&msg(
+            "spBv1.0/G/NBIRTH/E",
+            Bytes::from_static(&[0x12, 0x05])
+        ))
+        .await
+        .is_err()
+    );
+    assert!(
+        host.handle_incoming(&msg(
+            "spBv1.0/STATE/myhost",
+            Bytes::from_static(&[0xFF, 0xFE])
+        ))
+        .await
+        .is_err()
+    );
+}

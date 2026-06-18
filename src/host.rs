@@ -95,12 +95,18 @@ pub enum HostEvent {
         /// The data metrics.
         metrics: Vec<Metric>,
     },
-    /// An Edge Node death (its metrics, and its devices, are now stale).
+    /// An Edge Node death: its metrics, and the listed `devices`, are now stale
+    /// as of `timestamp` (epoch ms). The consumer should mark every cached metric
+    /// for this node and those devices stale.
     NodeDeath {
         /// Group ID.
         group: String,
         /// Edge Node ID.
         edge: String,
+        /// Death timestamp (the NDEATH payload timestamp, epoch ms).
+        timestamp: i64,
+        /// Devices that were online under this node and are now stale.
+        devices: Vec<String>,
     },
     /// A Device birth.
     DeviceBirth {
@@ -124,7 +130,8 @@ pub enum HostEvent {
         /// The data metrics.
         metrics: Vec<Metric>,
     },
-    /// A Device death (its metrics are now stale).
+    /// A Device death: its metrics are now stale as of `timestamp` (the DDEATH
+    /// payload timestamp, epoch ms).
     DeviceDeath {
         /// Group ID.
         group: String,
@@ -132,6 +139,8 @@ pub enum HostEvent {
         edge: String,
         /// Device ID.
         device: String,
+        /// Death timestamp (the DDEATH payload timestamp, epoch ms).
+        timestamp: i64,
     },
     /// The host requested a rebirth (published an NCMD) for an Edge Node.
     RebirthRequested {
@@ -321,7 +330,9 @@ impl<T: MqttTransport> HostApplication<T> {
             uuid: None,
             body: None,
         };
-        self.publish_raw(topic, encode(&payload, EncodeOptions::data()))
+        // Commands include datatypes so the receiver can decode them without a
+        // birth-derived registry (e.g. the un-aliased Node Control/Rebirth metric).
+        self.publish_raw(topic, encode(&payload, EncodeOptions::birth()))
             .await
     }
 
@@ -350,7 +361,9 @@ impl<T: MqttTransport> HostApplication<T> {
             uuid: None,
             body: None,
         };
-        self.publish_raw(topic, encode(&payload, EncodeOptions::data()))
+        // Commands include datatypes so the receiver can decode them without a
+        // birth-derived registry (e.g. the un-aliased Node Control/Rebirth metric).
+        self.publish_raw(topic, encode(&payload, EncodeOptions::birth()))
             .await
     }
 
@@ -383,7 +396,9 @@ impl<T: MqttTransport> HostApplication<T> {
             uuid: None,
             body: None,
         };
-        self.publish_raw(topic, encode(&payload, EncodeOptions::data()))
+        // Commands include datatypes so the receiver can decode them without a
+        // birth-derived registry (e.g. the un-aliased Node Control/Rebirth metric).
+        self.publish_raw(topic, encode(&payload, EncodeOptions::birth()))
             .await
     }
 
@@ -482,6 +497,11 @@ impl<T: MqttTransport> HostApplication<T> {
                     duplicate_alias = true;
                 }
             }
+            if duplicate_alias {
+                // A corrupt alias map must not accept subsequent DATA before the
+                // rebirth lands; invalidate the session now.
+                node.online = false;
+            }
         }
         if duplicate_alias {
             return self.rebirth(group, edge).await;
@@ -501,20 +521,27 @@ impl<T: MqttTransport> HostApplication<T> {
     ) -> Result<HostEvent> {
         let key = Self::key(group, edge);
         let step = match self.nodes.get_mut(&key) {
-            Some(node) if node.online => {
-                let payload = decode(payload, Some(&node.aliases))?;
-                if payload.seq == Some(node.expected_seq) {
+            Some(node) if node.online => match decode(payload, Some(&node.aliases)) {
+                // A malformed in-session payload is treated like a sequence
+                // anomaly: drop the session and request a (debounced) rebirth
+                // rather than failing the caller's receive loop.
+                Err(_) => {
+                    node.online = false;
+                    Step::Rebirth
+                }
+                Ok(payload) if payload.seq == Some(node.expected_seq) => {
                     node.expected_seq = node.expected_seq.wrapping_add(1);
                     Step::Event(HostEvent::NodeData {
                         group: group.as_str().to_owned(),
                         edge: edge.as_str().to_owned(),
                         metrics: resolve_names(&node.aliases, payload.metrics),
                     })
-                } else {
+                }
+                Ok(_) => {
                     node.online = false; // a gap invalidates the session until rebirth
                     Step::Rebirth
                 }
-            }
+            },
             _ => Step::Rebirth, // data before/without a birth
         };
         self.finish(group, edge, step).await
@@ -526,19 +553,36 @@ impl<T: MqttTransport> HostApplication<T> {
         edge: &EdgeNodeId,
         payload: &[u8],
     ) -> Result<HostEvent> {
-        let incoming = bdseq_of(&decode(payload, None)?);
+        let decoded = decode(payload, None)?;
+        let incoming = bdseq_of(&decoded);
+        let timestamp = decoded
+            .timestamp
+            .and_then(|t| i64::try_from(t).ok())
+            .unwrap_or_else(now_ms);
         let key = Self::key(group, edge);
+        // Honor the death only on a real, matching bdSeq (a `None == None` match
+        // — both sides omitting bdSeq — does not count).
         if let Some(node) = self.nodes.get_mut(&key)
             && node.online
+            && node.bd_seq.is_some()
             && node.bd_seq == incoming
         {
             node.online = false;
+            let mut devices: Vec<String> = node
+                .devices
+                .iter()
+                .filter(|(_, d)| d.online)
+                .map(|(name, _)| name.clone())
+                .collect();
+            devices.sort();
             for device in node.devices.values_mut() {
                 device.online = false;
             }
             return Ok(HostEvent::NodeDeath {
                 group: group.as_str().to_owned(),
                 edge: edge.as_str().to_owned(),
+                timestamp,
+                devices,
             });
         }
         // Unknown node, already offline, or bdSeq mismatch (stale death) -> ignore.
@@ -605,19 +649,25 @@ impl<T: MqttTransport> HostApplication<T> {
         let step = match self.nodes.get_mut(&key) {
             Some(node) if node.online && node.devices.get(&dev).is_some_and(|d| d.online) => {
                 let device_state = node.devices.get(&dev).expect("checked present");
-                let payload = decode(payload, Some(&device_state.aliases))?;
-                if payload.seq == Some(node.expected_seq) {
-                    node.expected_seq = node.expected_seq.wrapping_add(1);
-                    let device_state = node.devices.get(&dev).expect("checked present");
-                    Step::Event(HostEvent::DeviceData {
-                        group: group.as_str().to_owned(),
-                        edge: edge.as_str().to_owned(),
-                        device: dev.clone(),
-                        metrics: resolve_names(&device_state.aliases, payload.metrics),
-                    })
-                } else {
-                    node.online = false;
-                    Step::Rebirth
+                match decode(payload, Some(&device_state.aliases)) {
+                    Err(_) => {
+                        node.online = false;
+                        Step::Rebirth
+                    }
+                    Ok(payload) if payload.seq == Some(node.expected_seq) => {
+                        node.expected_seq = node.expected_seq.wrapping_add(1);
+                        let device_state = node.devices.get(&dev).expect("checked present");
+                        Step::Event(HostEvent::DeviceData {
+                            group: group.as_str().to_owned(),
+                            edge: edge.as_str().to_owned(),
+                            device: dev.clone(),
+                            metrics: resolve_names(&device_state.aliases, payload.metrics),
+                        })
+                    }
+                    Ok(_) => {
+                        node.online = false;
+                        Step::Rebirth
+                    }
                 }
             }
             _ => Step::Rebirth,
@@ -642,10 +692,15 @@ impl<T: MqttTransport> HostApplication<T> {
                     if let Some(device_state) = node.devices.get_mut(&dev) {
                         device_state.online = false;
                     }
+                    let timestamp = payload
+                        .timestamp
+                        .and_then(|t| i64::try_from(t).ok())
+                        .unwrap_or_else(now_ms);
                     Step::Event(HostEvent::DeviceDeath {
                         group: group.as_str().to_owned(),
                         edge: edge.as_str().to_owned(),
                         device: dev.clone(),
+                        timestamp,
                     })
                 } else {
                     node.online = false;
